@@ -1,0 +1,570 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Simulador Conceptual: Cambio de Marchas</title>
+<style>
+  html, body { height: 100%; margin: 0; background:#0f1418; font-family: system-ui, Segoe UI, Roboto, Arial, sans-serif; }
+  #wrap { height: 100%; display: grid; place-items: center; }
+  canvas { border-radius: 14px; box-shadow: 0 10px 40px rgba(0,0,0,.35); background:#0a0e12; }
+  .hud { position: fixed; left: 16px; bottom: 16px; color:#d6e6ff; font-size: 12px; opacity:.6 }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game" width="1100" height="680" aria-label="Simulador de Marchas"></canvas>
+</div>
+<div class="hud">
+  Controles: W=Acelerador · Space=Freno · Shift=Embrague ·
+  Clic Izq (con Shift)=Subir · Clic Der (con Shift)=Bajar · N→1ª=Shift+Space
+</div>
+
+<script>
+/* ============================
+   CONFIGURACIÓN DEL MOTOR
+   ============================ */
+const cfg = {
+  idleMin: 1000,            // rpm mínimo al ralentí
+  idleMax: 1500,            // rpm máximo al ralentí (arranque)
+  optimalMin: 2500,         // ventana óptima para upshift
+  optimalMax: 3500,
+  redline: 4500,            // aviso de zona roja (sobre-revolución)
+  hardMax: 5000,            // tope absoluto (clamp visual)
+  accelPerSec: 15,          // ΔRPM por segundo cuando se acelera (por tick)
+  decayToIdleK: 0.5,        // rapidez con la que cae a ralentí (por segundo)
+  brakeK: 4.0,              // rapidez extra de caída al frenar
+  // Relaciones de marcha (valores conceptuales; N==0 significa desacople)
+  gears: [
+    {name:'N', ratio: 0.00},
+    {name:'1', ratio: 3.50},
+    {name:'2', ratio: 2.20},
+    {name:'3', ratio: 1.50},
+    {name:'4', ratio: 1.10},
+    {name:'5', ratio: 0.90},
+  ],
+};
+
+/* ============================
+   ESTADO DEL SIMULADOR
+   ============================ */
+const state = {
+  gearIndex: 0,                      // arranca en Neutro
+  rpm: lerp(cfg.idleMin, cfg.idleMax, 0.5),
+  inputs: { w:false, shift:false, space:false, mouseL:false, mouseR:false },
+  lastTime: performance.now(),
+  agentMsgs: [],                     // cola de mensajes del “Agente”
+  justHitOptimal: false,             // bandera para mensaje “Momento óptimo”
+};
+
+/* ============================
+   UTILITARIOS
+   ============================ */
+function clamp(v, a, b){ return Math.max(a, Math.min(b, v)); }
+function lerp(a, b, t){ return a + (b-a)*t; }
+function map(v, a1, a2, b1, b2){ const t=(v-a1)/(a2-a1); return b1 + (b2-b1)*clamp(t,0,1); }
+function now(){ return performance.now(); }
+
+/* ============================
+   MENSAJES DEL AGENTE
+   ============================ */
+function say(text, kind='info', ttl=1800){
+  state.agentMsgs.push({ text, kind, born: now(), ttl });
+}
+function drawAgentMessages(ctx){
+  const baseY = 80;
+  for(let i=state.agentMsgs.length-1, row=0; i>=0; i--, row++){
+    const m = state.agentMsgs[i];
+    const age = now()-m.born;
+    const alive = age < m.ttl;
+    if(!alive){ state.agentMsgs.splice(i,1); continue; }
+    const alpha = age < 200 ? map(age,0,200,0,1) : map(age, m.ttl-300, m.ttl, 1, 0);
+    ctx.save();
+      ctx.globalAlpha = clamp(alpha,0,1);
+      ctx.font = "20px system-ui, Segoe UI, Roboto, Arial";
+      ctx.textAlign = "left"; ctx.textBaseline = "top";
+      const color = m.kind==='warn' ? "#ffb4a9" : m.kind==='ok' ? "#c0ffd3" : "#e7f0ff";
+      ctx.fillStyle = color;
+      const pad = 12, maxw = 560;
+      const metrics = ctx.measureText(m.text);
+      const w = Math.min(maxw, metrics.width + pad*2);
+      const h = 34;
+      const x = 260, y = baseY + row*(h+10);
+      // burbuja
+      ctx.fillStyle = "rgba(20,25,32,0.85)";
+      roundRect(ctx, x, y, w, h, 10); ctx.fill();
+      // texto
+      ctx.fillStyle = color;
+      ctx.fillText(m.text, x+pad, y+8);
+    ctx.restore();
+  }
+}
+function roundRect(ctx, x, y, w, h, r){
+  ctx.beginPath();
+  ctx.moveTo(x+r, y);
+  ctx.arcTo(x+w, y, x+w, y+h, r);
+  ctx.arcTo(x+w, y+h, x, y+h, r);
+  ctx.arcTo(x, y+h, x, y, r);
+  ctx.arcTo(x, y, x+w, y, r);
+  ctx.closePath();
+}
+
+/* ============================
+   ENTRADAS
+   ============================ */
+const KEY = { W:'KeyW', SHIFT:'ShiftLeft', SHIFT_R:'ShiftRight', SPACE:'Space' };
+
+addEventListener('keydown', (e)=>{
+  if(e.code===KEY.W) state.inputs.w = true;
+  if(e.code===KEY.SPACE) state.inputs.space = true;
+  if(e.code===KEY.SHIFT || e.code===KEY.SHIFT_R) state.inputs.shift = true;
+
+  // N -> 1ª requiere Shift + Space (pisar embrague y freno)
+  if(state.gearIndex===0 && state.inputs.shift && state.inputs.space){
+    state.gearIndex = 1;
+    state.rpm = clamp(state.rpm, cfg.idleMin, cfg.idleMax);
+    say("¡Listo! Engranaste 1ª (embrague+freno).", "ok");
+  }
+});
+
+addEventListener('keyup', (e)=>{
+  if(e.code===KEY.W) state.inputs.w = false;
+  if(e.code===KEY.SPACE) state.inputs.space = false;
+  if(e.code===KEY.SHIFT || e.code===KEY.SHIFT_R) state.inputs.shift = false;
+});
+
+addEventListener('mousedown', (e)=>{
+  // Evitar menú contextual para usar clic derecho
+  if(e.button===2) e.preventDefault();
+
+  // Cambios solo con Shift presionado
+  if(!state.inputs.shift) return;
+
+  const old = state.gearIndex;
+  if(e.button===0){ // subir
+    doUpshift();
+  }else if(e.button===2){ // bajar
+    doDownshift();
+  }
+
+  // si hubo cambio, suelta embrague “virtual” (no hay acople de vehículo aquí)
+});
+addEventListener('contextmenu', e=>e.preventDefault());
+
+/* ============================
+   LÓGICA DE CAMBIOS
+   ============================ */
+function doUpshift(){
+  if(state.gearIndex<=0){ say("Primero engrana 1ª (Shift+Space).", "warn"); return; }
+  if(state.gearIndex >= cfg.gears.length-1){ say("Ya estás en la marcha más alta.", "warn"); return; }
+
+  // Validar ventana óptima
+  if(state.rpm < cfg.optimalMin){
+    say("Necesitas más potencia (sube RPM antes de cambiar).", "warn");
+    return;
+  }
+  if(state.rpm > 4000){
+    say("¡Sobre-revolución! Baja la aceleración.", "warn");
+    // permitimos el cambio, pero lo marcamos como no óptimo
+  }
+
+  const oldGear = cfg.gears[state.gearIndex];
+  state.gearIndex += 1;
+  const newGear = cfg.gears[state.gearIndex];
+
+  // Ajuste instantáneo de RPM según relaciones
+  const ratio = (oldGear.ratio || 1) / (newGear.ratio || 1);
+  state.rpm = clamp(state.rpm * ratio, cfg.idleMin, cfg.redline);
+  say(`Subiste a ${newGear.name}ª.`, (state.rpm>=cfg.optimalMin && state.rpm<=cfg.optimalMax)?'ok':'info');
+}
+
+function doDownshift(){
+  if(state.gearIndex<=1){ // si estás en 1ª o N
+    if(state.gearIndex===1){ state.gearIndex=0; say("Pasaste a Neutro (N).", "info"); }
+    else say("Ya estás en Neutro.", "warn");
+    return;
+  }
+  const oldGear = cfg.gears[state.gearIndex];
+  state.gearIndex -= 1;
+  const newGear = cfg.gears[state.gearIndex];
+
+  // Ajuste de RPM hacia arriba por reducción
+  const ratio = (oldGear.ratio || 1) / (newGear.ratio || 1);
+  state.rpm = clamp(state.rpm / ratio, cfg.idleMin, cfg.hardMax);
+  if(state.rpm > cfg.redline) say("Cuidado: reducción agresiva (RPM altas).", "warn");
+  say(`Bajaste a ${newGear.name}ª.`, "info");
+}
+
+/* ============================
+   BUCLE PRINCIPAL
+   ============================ */
+const cvs = document.getElementById('game');
+const ctx  = cvs.getContext('2d');
+
+function step(){
+  const t = performance.now();
+  const dt = Math.min(0.05, (t - state.lastTime) / 1000); // dt en segundos (clamp 50 ms)
+  state.lastTime = t;
+
+  // 1) Física sencilla de RPM
+  const targetIdle = lerp(cfg.idleMin, cfg.idleMax, 0.35);
+  let rpm = state.rpm;
+
+  if(state.gearIndex>0 && state.inputs.w){
+    rpm += cfg.accelPerSec * dt * 100;  // amplifica el efecto para hacerlo visible
+  } else {
+    // cae hacia ralentí
+    const k = state.inputs.space ? (cfg.decayToIdleK + cfg.brakeK) : cfg.decayToIdleK;
+    rpm += (targetIdle - rpm) * k * dt;
+  }
+
+  // límites
+  rpm = clamp(rpm, cfg.idleMin*0.8, cfg.hardMax);
+  state.rpm = rpm;
+
+  // 2) Señal “momento óptimo”
+  const inOptimal = (rpm >= cfg.optimalMin && rpm <= cfg.optimalMax && state.gearIndex>0 && state.gearIndex<cfg.gears.length-1);
+  if(inOptimal && !state.justHitOptimal){
+    say("¡Momento óptimo! Mantén embrague (Shift) y clic izquierdo para subir marcha.", "ok", 2400);
+    state.justHitOptimal = true;
+  }
+  if(!inOptimal) state.justHitOptimal = false;
+
+  // 3) Render
+  render();
+
+  requestAnimationFrame(step);
+}
+
+requestAnimationFrame(step);
+
+/* ============================
+   RENDER
+   ============================ */
+function render(){
+  const w = cvs.width, h = cvs.height;
+
+  // FONDO base
+  ctx.clearRect(0,0,w,h);
+  ctx.fillStyle = "#0a0e12";
+  ctx.fillRect(0,0,w,h);
+
+  // === Metáfora 1: “Más Luz, Más Velocidad”
+  // brillo proporcional a RPM; elevamos luminancia con un overlay blanco translúcido
+  const brightT = map(state.rpm, cfg.idleMin, cfg.redline, 0.05, 0.38);
+  ctx.save();
+    ctx.globalAlpha = brightT;
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0,0,w,h);
+  ctx.restore();
+
+  // === Barra de progreso vertical (cohete)
+  drawRocketBar(ctx);
+
+  // === Volante y Tablero (solo visual)
+  drawSteeringWheel(ctx);
+  drawInstrumentCluster(ctx);
+
+  // === Tablero/HUD (donde puedes integrar los artefactos visuales del boceto)
+  drawDashboard(ctx);
+
+  // === Mensajes del Agente
+  drawAgentMessages(ctx);
+
+  // === Comentarios para integrar UI del boceto ===
+  // - Sustituye drawSteeringWheel() por imágenes SVG/PNG del volante/tablero.
+  // - Reemplaza drawGearStickHint() por tu arte de palanca y animaciones.
+  // - En drawRocketBar() puedes usar sprites: cohete, planeta/galaxia y barra.
+}
+
+/* ----- HUD principal: RPM, marcha y tips ----- */
+function drawDashboard(ctx){
+  const pad = 20;
+
+  // Cartela superior derecha con RPM
+  const rpmText = `Revoluciones: ${(state.rpm/1000).toFixed(1)} x 1000 rpm`;
+  ctx.save();
+    ctx.font = "20px system-ui, Segoe UI, Roboto, Arial";
+    ctx.textAlign = "right"; ctx.textBaseline = "top";
+    const tw = ctx.measureText(rpmText).width;
+    const rpmBx = cvs.width - pad - tw - 30, rpmBy = pad, rpmBw = tw + 30, rpmBh = 38;
+    ctx.fillStyle = "rgba(24,44,52,0.85)";
+    roundRect(ctx, rpmBx, rpmBy, rpmBw, rpmBh, 14); ctx.fill();
+    ctx.fillStyle = "#e5f6ff";
+    ctx.fillText(rpmText, cvs.width - pad - 16, rpmBy+9);
+  ctx.restore();
+
+  // Caja inferior con estado de marcha y controles
+  const gear = cfg.gears[state.gearIndex].name;
+  const status = `Marcha: ${gear}    ${state.inputs.shift?'[Embrague: ON]':'[Embrague: OFF]'}    ${state.inputs.w?'[Acelerando]':''} ${state.inputs.space?'[Frenando]':''}`;
+  ctx.save();
+    ctx.font = "18px system-ui, Segoe UI, Roboto, Arial";
+    ctx.textAlign = "center"; ctx.textBaseline = "bottom";
+    ctx.fillStyle = "rgba(24,44,52,0.85)";
+    const statusBw = 720, statusBh = 44, statusBx = (cvs.width-statusBw)/2, statusBy = cvs.height-20-statusBh;
+    roundRect(ctx, statusBx, statusBy, statusBw, statusBh, 12); ctx.fill();
+    ctx.fillStyle = "#d8ecff";
+    ctx.fillText(status, cvs.width/2, statusBy+statusBh-12);
+  ctx.restore();
+
+  // Hint de palanca (clic izq/der + Shift)
+  drawGearStickHint(ctx);
+}
+
+function drawGearStickHint(ctx){
+  ctx.save();
+    const x = cvs.width - 220, y = cvs.height - 220;
+    ctx.fillStyle = "rgba(255,255,255,0.06)";
+    roundRect(ctx, x, y, 200, 140, 14); ctx.fill();
+
+    ctx.font = "14px system-ui, Segoe UI, Roboto, Arial";
+    ctx.fillStyle = "#c9d9ff";
+    ctx.textAlign = "left"; ctx.textBaseline = "top";
+    ctx.fillText("Cambios (mantén Shift):", x+12, y+10);
+    ctx.fillText("• Clic Izq: Subir marcha", x+12, y+36);
+    ctx.fillText("• Clic Der: Bajar marcha", x+12, y+58);
+    ctx.fillText("N → 1ª: Shift + Space", x+12, y+92);
+  ctx.restore();
+}
+
+/* ----- Metáfora 2: Cohete/Galaxia (progreso RPM) ----- */
+function drawRocketBar(ctx){
+  const bar = { x: 40, y: 80, w: 46, h: cvs.height - 160, r: 16 };
+  // Barra contenedor
+  ctx.save();
+    ctx.fillStyle = "rgba(255,255,255,0.08)";
+    roundRect(ctx, bar.x, bar.y, bar.w, bar.h, bar.r); ctx.fill();
+
+    // Planeta/galaxia: marca del umbral óptimo (entre 2500-3500 rpm).
+    const tOpt = map(state.rpm, cfg.idleMin, cfg.redline, 0, 1); // no usado para la posición del planeta
+    const optMid = (cfg.optimalMin + cfg.optimalMax)/2;
+    const optY = map(optMid, cfg.idleMin, cfg.redline, bar.y+bar.h-24, bar.y+24);
+
+    // Línea/“planeta” objetivo
+    ctx.beginPath();
+    ctx.arc(bar.x + bar.w/2, optY, 14, 0, Math.PI*2);
+    ctx.fillStyle = "rgba(80,180,255,0.25)";
+    ctx.fill();
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = "#4ac0ff";
+    ctx.stroke();
+
+    // Zona óptima (banda)
+    const optY1 = map(cfg.optimalMax, cfg.idleMin, cfg.redline, bar.y+bar.h, bar.y);
+    const optY2 = map(cfg.optimalMin, cfg.idleMin, cfg.redline, bar.y+bar.h, bar.y);
+    ctx.fillStyle = "rgba(74,192,255,0.12)";
+    ctx.fillRect(bar.x+6, optY1, bar.w-12, Math.max(6, optY2-optY1));
+
+    // Progreso del cohete según RPM
+    const t = map(state.rpm, cfg.idleMin, cfg.redline, 0, 1);
+    const rocketY = map(state.rpm, cfg.idleMin, cfg.redline, bar.y+bar.h-20, bar.y+20);
+
+    // “Combustible” (relleno)
+    ctx.fillStyle = "linear-gradient(#fff,#fff)"; // placeholder
+    ctx.fillStyle = "rgba(74,192,255,0.35)";
+    const fillTop = rocketY;
+    roundRect(ctx, bar.x+10, fillTop, bar.w-20, bar.y+bar.h - fillTop, 8); ctx.fill();
+
+    // Cohete (placeholder vectorial; aquí puedes colocar tu sprite PNG/SVG)
+    drawRocketIcon(ctx, bar.x + bar.w/2, rocketY);
+
+    // Marcas de escala
+    ctx.strokeStyle = "rgba(255,255,255,0.15)";
+    ctx.lineWidth = 1;
+    const steps = 6;
+    for(let i=0;i<=steps;i++){
+      const yy = map(i/steps, 0,1, bar.y+bar.h, bar.y);
+      ctx.beginPath(); ctx.moveTo(bar.x+bar.w+6, yy); ctx.lineTo(bar.x+bar.w+18, yy); ctx.stroke();
+      const rpmMark = Math.round(lerp(cfg.idleMin, cfg.redline, i/steps)/100)*100;
+      ctx.fillStyle = "rgba(220,235,255,0.6)";
+      ctx.font = "12px system-ui"; ctx.textAlign = "left"; ctx.textBaseline = "middle";
+      ctx.fillText(`${(rpmMark/1000).toFixed(1)}k`, bar.x+bar.w+22, yy);
+    }
+  ctx.restore();
+}
+
+/* ----- Volante (visual, centrado) ----- */
+function drawSteeringWheel(ctx){
+  const size = 270;
+  const pad = 28;
+  const x = cvs.width/2;
+  const y = cvs.height/1.8;
+
+  ctx.save();
+    // contenedor suave
+    ctx.fillStyle = "rgba(255,255,255,0.06)";
+    roundRect(ctx, x - size/2 - 8, y - size/2 - 8, size + 16, size + 16, 14); ctx.fill();
+
+    const outerR = size/2;        // aro exterior
+    const innerR = outerR * 0.78; // aro interior
+
+    // aro exterior (tono marfil)
+    ctx.fillStyle = "#e9e2d4";
+    ctx.beginPath();
+    ctx.arc(x,y, outerR, 0, Math.PI*2);
+    ctx.arc(x,y, outerR-14, 0, Math.PI*2, true);
+    ctx.closePath();
+    ctx.fill();
+    ctx.strokeStyle = "rgba(40,40,40,0.25)";
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(x,y, outerR-7, 0, Math.PI*2); ctx.stroke();
+
+    // aro interior (metal pulido)
+    const metal = ctx.createLinearGradient(x-innerR, y-innerR, x+innerR, y+innerR);
+    metal.addColorStop(0, "#9fb3bf");
+    metal.addColorStop(0.5, "#c7d6df");
+    metal.addColorStop(1, "#90a3ae");
+    ctx.fillStyle = metal;
+    ctx.beginPath();
+    ctx.arc(x,y, innerR, 0, Math.PI*2);
+    ctx.arc(x,y, innerR-10, 0, Math.PI*2, true);
+    ctx.closePath();
+    ctx.fill();
+
+    // centro con emblema de 3 puntas
+    const hubR = innerR*0.46;
+    ctx.fillStyle = "#1f2a33";
+    ctx.beginPath(); ctx.arc(x,y, hubR+6, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = "#dbe9f3";
+    ctx.beginPath(); ctx.arc(x,y, hubR, 0, Math.PI*2); ctx.fill();
+    ctx.strokeStyle = "#97aebe";
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(x,y, hubR, 0, Math.PI*2); ctx.stroke();
+
+    // estrella de tres puntas simplificada
+    const starR = hubR*0.86;
+    ctx.strokeStyle = "#32505f";
+    ctx.lineWidth = 3;
+    for(let i=0;i<3;i++){
+      const a = -Math.PI/2 + i*(2*Math.PI/3);
+      const px = x + Math.cos(a)* starR;
+      const py = y + Math.sin(a)* starR;
+      ctx.beginPath();
+      ctx.moveTo(x,y); ctx.lineTo(px,py); ctx.stroke();
+    }
+    ctx.strokeStyle = "#7fa4b6";
+    ctx.lineWidth = 1.6;
+    ctx.beginPath(); ctx.arc(x,y, starR, 0, Math.PI*2); ctx.stroke();
+  ctx.restore();
+}
+
+/* ----- Tablero / Instrument Cluster (visual, zona superior central) ----- */
+function drawInstrumentCluster(ctx){
+  const clusterW = 320;
+  const clusterH = 160;
+  const x = (cvs.width - clusterW)/2;
+  const y = 72;
+
+  ctx.save();
+    // contenedor
+    ctx.fillStyle = "rgba(255,255,255,0.06)";
+    roundRect(ctx, x, y, clusterW, clusterH, 16); ctx.fill();
+
+    // tacómetro circular a la izquierda
+    const cx = x + 110;
+    const cy = y + clusterH/2 + 10;
+    const rOuter = 62;
+    const rInner = 50;
+
+    // fondo
+    ctx.fillStyle = "#152027";
+    ctx.beginPath(); ctx.arc(cx,cy,rOuter,0,Math.PI*2); ctx.fill();
+
+    // arco de zona óptima
+    const aStart = Math.PI*1.2; // -144°
+    const aEnd   = Math.PI*1.95; // ~+171°
+    const optT1 = (cfg.optimalMin - cfg.idleMin) / (cfg.redline - cfg.idleMin);
+    const optT2 = (cfg.optimalMax - cfg.idleMin) / (cfg.redline - cfg.idleMin);
+    const optA1 = aStart + (aEnd-aStart)*optT1;
+    const optA2 = aStart + (aEnd-aStart)*optT2;
+    ctx.strokeStyle = "rgba(74,192,255,0.45)";
+    ctx.lineWidth = 10;
+    ctx.beginPath(); ctx.arc(cx,cy,rInner, optA1, optA2); ctx.stroke();
+
+    // marcas
+    ctx.strokeStyle = "rgba(220,235,255,0.5)";
+    ctx.lineWidth = 2;
+    const marks = 6;
+    for(let i=0;i<=marks;i++){
+      const t = i/marks;
+      const a = aStart + (aEnd-aStart)*t;
+      const x1 = cx + Math.cos(a)* (rInner-8);
+      const y1 = cy + Math.sin(a)* (rInner-8);
+      const x2 = cx + Math.cos(a)* (rInner+8);
+      const y2 = cy + Math.sin(a)* (rInner+8);
+      ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+      ctx.fillStyle = "rgba(220,235,255,0.7)";
+      ctx.font = "12px system-ui"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      const lx = cx + Math.cos(a)* (rInner+20);
+      const ly = cy + Math.sin(a)* (rInner+20);
+      const rpmMark = lerp(cfg.idleMin, cfg.redline, t)/1000;
+      ctx.fillText(`${rpmMark.toFixed(1)}k`, lx, ly);
+    }
+
+    // aguja según RPM
+    const tRpm = (state.rpm - cfg.idleMin) / (cfg.redline - cfg.idleMin);
+    const aNeedle = aStart + (aEnd-aStart) * clamp(tRpm,0,1);
+    const nx = cx + Math.cos(aNeedle)* (rInner+2);
+    const ny = cy + Math.sin(aNeedle)* (rInner+2);
+    ctx.strokeStyle = "#ffb47a";
+    ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(cx,cy); ctx.lineTo(nx,ny); ctx.stroke();
+    ctx.fillStyle = "#e9f6ff";
+    ctx.beginPath(); ctx.arc(cx,cy,4,0,Math.PI*2); ctx.fill();
+
+    // cuadro informativo a la derecha (marcha actual)
+    const gear = cfg.gears[state.gearIndex].name;
+    const bx = x + 200, by = y + 30, bw = 96, bh = 96;
+    ctx.fillStyle = "rgba(24,44,52,0.85)";
+    roundRect(ctx, bx, by, bw, bh, 12); ctx.fill();
+    ctx.fillStyle = "#cfe6ff";
+    ctx.font = "14px system-ui"; ctx.textAlign = "center"; ctx.textBaseline = "top";
+    ctx.fillText("Marcha", bx + bw/2, by + 8);
+    ctx.font = "46px system-ui"; ctx.textBaseline = "middle";
+    ctx.fillText(gear, bx + bw/2, by + bh/2 + 6);
+  ctx.restore();
+}
+
+function drawRocketIcon(ctx, cx, cy){
+  ctx.save();
+    ctx.translate(cx, cy);
+    // cuerpo
+    ctx.fillStyle = "#bfe6ff";
+    ctx.beginPath();
+    ctx.moveTo(0,-12);
+    ctx.quadraticCurveTo(10,-2, 8,10);
+    ctx.lineTo(-8,10);
+    ctx.quadraticCurveTo(-10,-2, 0,-12);
+    ctx.fill();
+
+    // ventanilla
+    ctx.beginPath();
+    ctx.arc(0,-4,4,0,Math.PI*2);
+    ctx.fillStyle = "#203040";
+    ctx.fill();
+
+    // llama
+    ctx.beginPath();
+    ctx.moveTo(0,14);
+    ctx.lineTo(5,22);
+    ctx.lineTo(-5,22);
+    ctx.closePath();
+    ctx.fillStyle = "rgba(255,180,120,0.9)";
+    ctx.fill();
+  ctx.restore();
+}
+
+/* ============================
+   PUNTOS DE INTEGRACIÓN VISUAL
+   ============================
+   - Sustituye drawRocketIcon() por tu sprite de cohete.
+   - Reemplaza la “galaxia” (círculo) por un PNG/SVG del planeta/galaxia del boceto.
+   - En drawDashboard():
+       · Inserta imágenes del volante/tablero y pedales en posiciones fijas.
+       · Puedes animar pedales (W/Space/Shift) cambiando escala o luminosidad.
+   - El brillo global (overlay blanco) ya representa “Más Luz, Más Velocidad”;
+     si usas una imagen de fondo, pinta la imagen ANTES del overlay.
+*/
+</script>
+</body>
+</html>
