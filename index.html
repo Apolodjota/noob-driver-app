@@ -8,12 +8,32 @@
   html, body { height: 100%; margin: 0; background:#0f1418; font-family: system-ui, Segoe UI, Roboto, Arial, sans-serif; }
   #wrap { height: 100%; display: grid; place-items: center; }
   canvas { border-radius: 14px; box-shadow: 0 10px 40px rgba(0,0,0,.35); background:#0a0e12; }
-  .hud { position: fixed; left: 16px; bottom: 16px; color:#d6e6ff; font-size: 12px; opacity:.6 }
+  .hud { position: fixed; left: 16px; bottom: 50px; color:#d6e6ff; font-size: 20px; opacity:.6 }
+  .ai-tools { position: fixed; right: 16px; top: 16px; display: flex; gap: 8px; align-items: center; }
+  .ai-tools button { padding: 8px 12px; border-radius: 8px; border: 1px solid #2a3a46; background:#14202a; color:#d8ecff; cursor: pointer; }
+  .agent-panel { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; background: rgba(5,8,12,0.72); }
+  .agent-card { width: 720px; max-width: calc(100% - 40px); background: #10161d; color:#e8f2ff; border: 1px solid #2a3a46; border-radius: 14px; box-shadow: 0 10px 40px rgba(0,0,0,.45); padding: 18px 20px; }
+  .agent-card h3 { margin: 6px 0 10px; font-weight: 600; }
+  .agent-card pre { white-space: pre-wrap; font-family: inherit; background: #0c1218; padding: 12px; border-radius: 10px; border: 1px solid #22313c; }
+  .agent-actions { display:flex; gap: 10px; justify-content: flex-end; margin-top: 12px; }
+  .agent-actions button { padding: 10px 12px; border-radius: 10px; border: 1px solid #2a3a46; background:#16222c; color:#d8ecff; cursor: pointer; }
 </style>
 </head>
 <body>
 <div id="wrap">
-  <canvas id="game" width="1100" height="680" aria-label="Simulador de Marchas"></canvas>
+  <canvas id="game" width="1280" height="800" aria-label="Simulador de Marchas"></canvas>
+</div>
+<div class="ai-tools">
+  <button id="btnToggle" aria-pressed="true">Apoyo de agente: ON</button>
+</div>
+<div id="agentPanel" class="agent-panel">
+  <div class="agent-card">
+    <h3>Asesor de Conducción</h3>
+    <div id="agentReason" style="color:#a6c8ff; font-size:14px; margin-bottom:8px"></div>
+    <pre id="agentAdvice"></pre>
+    <div class="agent-actions" style="justify-content:center; color:#9fc7ff">Pulsa Space para continuar</div>
+  </div>
+  
 </div>
 <div class="hud">
   Controles: W=Acelerador · Space=Freno · Shift=Embrague ·
@@ -55,6 +75,19 @@ const state = {
   lastTime: performance.now(),
   agentMsgs: [],                     // cola de mensajes del “Agente”
   justHitOptimal: false,             // bandera para mensaje “Momento óptimo”
+  audio: { ctx:null, started:false, gain:null, osc1:null, osc2:null, filter:null }
+};
+// Estado del modo Agente
+state.agent = {
+  active: false,
+  slowing: 0,           // 0..1 factor de pausa progresiva
+  lastTrigger: 0,
+  reason: '',
+  apiKey: 'REEMPLAZA_CON_TU_API_KEY',
+  metrics: { timeInNeutral:0, timeAboveRed:0, timeNoClutchAttempt:0 },
+  enabled: true,
+  history: [],          // buffer de últimas acciones
+  cooldownMs: 15000,
 };
 
 /* ============================
@@ -69,9 +102,11 @@ function now(){ return performance.now(); }
    MENSAJES DEL AGENTE
    ============================ */
 function say(text, kind='info', ttl=1800){
+  if(state.agent && state.agent.active) return; // suprimir cuando el agente esté activo
   state.agentMsgs.push({ text, kind, born: now(), ttl });
 }
 function drawAgentMessages(ctx){
+  if(state.agent && state.agent.active) return; // no mostrar mientras el agente ocupa la pantalla
   const baseY = 80;
   for(let i=state.agentMsgs.length-1, row=0; i>=0; i--, row++){
     const m = state.agentMsgs[i];
@@ -119,6 +154,8 @@ addEventListener('keydown', (e)=>{
   if(e.code===KEY.SPACE) state.inputs.space = true;
   if(e.code===KEY.SHIFT || e.code===KEY.SHIFT_R) state.inputs.shift = true;
 
+  ensureAudio();
+
   // N -> 1ª requiere Shift + Space (pisar embrague y freno)
   if(state.gearIndex===0 && state.inputs.shift && state.inputs.space){
     state.gearIndex = 1;
@@ -131,11 +168,17 @@ addEventListener('keyup', (e)=>{
   if(e.code===KEY.W) state.inputs.w = false;
   if(e.code===KEY.SPACE) state.inputs.space = false;
   if(e.code===KEY.SHIFT || e.code===KEY.SHIFT_R) state.inputs.shift = false;
+  // Reanudar con Space cuando el agente esté activo
+  if(e.code===KEY.SPACE && state.agent.active){
+    endAgentSession();
+  }
 });
 
 addEventListener('mousedown', (e)=>{
   // Evitar menú contextual para usar clic derecho
   if(e.button===2) e.preventDefault();
+
+  ensureAudio();
 
   // Cambios solo con Shift presionado
   if(!state.inputs.shift) return;
@@ -150,6 +193,19 @@ addEventListener('mousedown', (e)=>{
   // si hubo cambio, suelta embrague “virtual” (no hay acople de vehículo aquí)
 });
 addEventListener('contextmenu', e=>e.preventDefault());
+
+// Controles UI agente
+const $btnToggle = () => document.getElementById('btnToggle');
+const $panel = () => document.getElementById('agentPanel');
+const $advice = () => document.getElementById('agentAdvice');
+const $reason = () => document.getElementById('agentReason');
+// botones eliminados
+
+addEventListener('DOMContentLoaded', ()=>{
+  $btnToggle().addEventListener('click', toggleAgent);
+  state.agent.enabled = true; // ON por defecto
+  $btnToggle().setAttribute('aria-pressed','true');
+});
 
 /* ============================
    LÓGICA DE CAMBIOS
@@ -201,37 +257,112 @@ function doDownshift(){
 const cvs = document.getElementById('game');
 const ctx  = cvs.getContext('2d');
 
+/* ============================
+   AUDIO DEL MOTOR (WebAudio)
+   ============================ */
+function ensureAudio(){
+  if(state.audio.started) return;
+  try{
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    const ac = new AudioCtx();
+    const osc1 = ac.createOscillator(); // tono fundamental (pulso motor)
+    const osc2 = ac.createOscillator(); // armónico
+    const filter = ac.createBiquadFilter();
+    const gain = ac.createGain();
+
+    osc1.type = 'sawtooth';
+    osc2.type = 'square';
+    filter.type = 'lowpass';
+    filter.frequency.value = 1200;
+    gain.gain.value = 0.0; // silencio inicial
+
+    osc1.connect(filter);
+    osc2.connect(filter);
+    filter.connect(gain);
+    gain.connect(ac.destination);
+
+    const t = ac.currentTime + 0.01;
+    osc1.start(t);
+    osc2.start(t);
+
+    state.audio = { ctx: ac, started: true, gain, osc1, osc2, filter };
+  }catch(err){
+    // si falla, no bloqueamos el simulador
+    state.audio.started = false;
+  }
+}
+
+function updateAudio(){
+  if(!state.audio.started) return;
+  const { ctx:ac, gain, osc1, osc2, filter } = state.audio;
+
+  // Frecuencia base proporcional a RPM (pulsos por revolución aproximados)
+  const baseHz = Math.max(28, (state.rpm/60) * 2);
+  const tNow = ac.currentTime;
+  if(osc1 && osc2){
+    osc1.frequency.setTargetAtTime(baseHz, tNow, 0.03);
+    osc2.frequency.setTargetAtTime(baseHz*2, tNow, 0.03);
+  }
+
+  // Intensidad y brillo según acelerador y marcha engranada
+  const throttle = state.inputs.w && state.gearIndex>0 ? 1 : 0;
+  const idleLevel = 0.02;
+  const driveLevel = 0.12;
+  const targetGain = throttle ? driveLevel : idleLevel;
+  if(gain){
+    gain.gain.setTargetAtTime(targetGain, tNow, 0.08);
+  }
+  if(filter){
+    const cut = throttle ? 2000 : 1200;
+    filter.frequency.setTargetAtTime(cut, tNow, 0.08);
+    filter.Q.setTargetAtTime(throttle ? 0.8 : 0.5, tNow, 0.08);
+  }
+}
+
 function step(){
   const t = performance.now();
   const dt = Math.min(0.05, (t - state.lastTime) / 1000); // dt en segundos (clamp 50 ms)
   state.lastTime = t;
+
+  // factor de pausa progresiva (1 = normal, 0 = detenido)
+  const targetSlow = state.agent.active ? 1 : 0;
+  state.agent.slowing += (targetSlow - state.agent.slowing) * 0.08;
+  const simSpeed = Math.max(0, 1 - state.agent.slowing);
+  const dtEff = dt * simSpeed;
 
   // 1) Física sencilla de RPM
   const targetIdle = lerp(cfg.idleMin, cfg.idleMax, 0.35);
   let rpm = state.rpm;
 
   if(state.gearIndex>0 && state.inputs.w){
-    rpm += cfg.accelPerSec * dt * 100;  // amplifica el efecto para hacerlo visible
+    rpm += cfg.accelPerSec * dtEff * 100;  // amplifica el efecto para hacerlo visible
   } else {
     // cae hacia ralentí
     const k = state.inputs.space ? (cfg.decayToIdleK + cfg.brakeK) : cfg.decayToIdleK;
-    rpm += (targetIdle - rpm) * k * dt;
+    rpm += (targetIdle - rpm) * k * dtEff;
   }
 
   // límites
   rpm = clamp(rpm, cfg.idleMin*0.8, cfg.hardMax);
   state.rpm = rpm;
 
-  // 2) Señal “momento óptimo”
+  // 2) Señal “momento óptimo” (desactivada durante agente)
   const inOptimal = (rpm >= cfg.optimalMin && rpm <= cfg.optimalMax && state.gearIndex>0 && state.gearIndex<cfg.gears.length-1);
-  if(inOptimal && !state.justHitOptimal){
+  if(!state.agent.active && inOptimal && !state.justHitOptimal){
     say("¡Momento óptimo! Mantén embrague (Shift) y clic izquierdo para subir marcha.", "ok", 2400);
     state.justHitOptimal = true;
   }
   if(!inOptimal) state.justHitOptimal = false;
 
+  // 2b) Métricas para detección de coaching
+  updateCoachingMetrics(dtEff);
+  maybeTriggerAgent();
+
   // 3) Render
   render();
+
+  // 4) Audio
+  updateAudio();
 
   requestAnimationFrame(step);
 }
@@ -248,6 +379,9 @@ function render(){
   ctx.clearRect(0,0,w,h);
   ctx.fillStyle = "#0a0e12";
   ctx.fillRect(0,0,w,h);
+
+  // Interior del coche (parabrisas, pilares y tablero)
+  drawCabin(ctx);
 
   // === Metáfora 1: “Más Luz, Más Velocidad”
   // brillo proporcional a RPM; elevamos luminancia con un overlay blanco translúcido
@@ -267,6 +401,9 @@ function render(){
 
   // === Tablero/HUD (donde puedes integrar los artefactos visuales del boceto)
   drawDashboard(ctx);
+
+  // === Pedales (Embrague-Shift, Freno-Space, Acelerador-W)
+  drawPedals(ctx);
 
   // === Mensajes del Agente
   drawAgentMessages(ctx);
@@ -309,6 +446,97 @@ function drawDashboard(ctx){
 
   // Hint de palanca (clic izq/der + Shift)
   drawGearStickHint(ctx);
+}
+
+/* ----- Interior del coche (parabrisas/pilares/tablero superior) ----- */
+function drawCabin(ctx){
+  const w = cvs.width, h = cvs.height;
+  ctx.save();
+    // Parabrisas degradado
+    const sky = ctx.createLinearGradient(0,0,0,h*0.5);
+    sky.addColorStop(0, "#0e1520");
+    sky.addColorStop(1, "#0a0e12");
+    ctx.fillStyle = sky;
+    ctx.beginPath();
+    ctx.moveTo(80, 40);
+    ctx.quadraticCurveTo(w/2, 10, w-80, 40);
+    ctx.lineTo(w-60, h*0.42);
+    ctx.quadraticCurveTo(w/2, h*0.48, 60, h*0.42);
+    ctx.closePath();
+    ctx.fill();
+
+    // Pilares A izquierdo/derecho
+    ctx.fillStyle = "#1a2129";
+    ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(120,0); ctx.lineTo(80,220); ctx.lineTo(0,260); ctx.closePath(); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(w,0); ctx.lineTo(w-120,0); ctx.lineTo(w-80,220); ctx.lineTo(w,260); ctx.closePath(); ctx.fill();
+
+}
+
+/* ----- Pedales con feedback visual ----- */
+function drawPedals(ctx){
+  const areaW = 520;
+  const areaH = 160;
+  const baseY = cvs.height - 80 - areaH;
+  const baseX = (cvs.width - areaW)/2;
+
+  const pedals = [
+    { key:'shift', label:'Shift', x: baseX,          w: 150 }, // Embrague
+    { key:'space', label:'Space', x: baseX + 185,    w: 150 }, // Freno
+    { key:'w',     label:'W',     x: baseX + 370,    w: 150 }, // Acelerador
+  ];
+
+  pedals.forEach((p, i)=>{
+    const pressed = !!state.inputs[p.key];
+    const y = baseY + (pressed ? 10 : 0);
+    const h = areaH - (pressed ? 16 : 0);
+    ctx.save();
+      // Sombra
+      ctx.globalAlpha = 0.6;
+      ctx.fillStyle = "rgba(0,0,0,0.35)";
+      roundRect(ctx, p.x+6, baseY+areaH-10, p.w-12, 10, 6); ctx.fill();
+      ctx.globalAlpha = 1;
+
+      // Cuerpo del pedal
+      const grad = ctx.createLinearGradient(p.x, y, p.x, y+h);
+      grad.addColorStop(0, pressed?"#9fc7ff":"#d3e4f7");
+      grad.addColorStop(1, pressed?"#7ca7e6":"#bcd3ea");
+      ctx.fillStyle = grad;
+      roundRect(ctx, p.x, y, p.w, h, 14); ctx.fill();
+
+      // Borde
+      ctx.strokeStyle = pressed?"#5e85b8":"#7f9fbf";
+      ctx.lineWidth = 2;
+      roundRect(ctx, p.x, y, p.w, h, 14); ctx.stroke();
+
+      // Etiqueta
+      ctx.fillStyle = "#10202a";
+      ctx.font = "22px system-ui";
+      ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.fillText(p.label, p.x + p.w/2, y + h/2);
+    ctx.restore();
+  });
+
+  ctx.save();
+    ctx.fillStyle = "rgba(220,235,255,0.75)";
+    ctx.font = "16px system-ui";
+    ctx.textAlign = "center"; ctx.textBaseline = "bottom";
+    ctx.fillText("Pedal Embrague (Shift)", cvs.width/2.8, baseY - 0.1);
+  ctx.restore();
+
+  ctx.save();
+    ctx.fillStyle = "rgba(220,235,255,0.75)";
+    ctx.font = "16px system-ui";
+    ctx.textAlign = "center"; ctx.textBaseline = "bottom";
+    ctx.fillText("Pedal Freno (Space)", cvs.width/2, baseY - 0.1);
+  ctx.restore();
+
+  ctx.save();
+    ctx.fillStyle = "rgba(220,235,255,0.75)";
+    ctx.font = "16px system-ui";
+    ctx.textAlign = "center"; ctx.textBaseline = "bottom";
+    ctx.fillText("Pedal Acelerador (W)", cvs.width/1.55, baseY - 0.1);
+  ctx.restore();
+  
 }
 
 function drawGearStickHint(ctx){
@@ -385,10 +613,10 @@ function drawRocketBar(ctx){
 
 /* ----- Volante (visual, centrado) ----- */
 function drawSteeringWheel(ctx){
-  const size = 270;
+  const size = 280;
   const pad = 28;
   const x = cvs.width/2;
-  const y = cvs.height/1.8;
+  const y = cvs.height/2.1;
 
   ctx.save();
     // contenedor suave
@@ -555,16 +783,202 @@ function drawRocketIcon(ctx, cx, cy){
 }
 
 /* ============================
-   PUNTOS DE INTEGRACIÓN VISUAL
-   ============================
-   - Sustituye drawRocketIcon() por tu sprite de cohete.
-   - Reemplaza la “galaxia” (círculo) por un PNG/SVG del planeta/galaxia del boceto.
-   - En drawDashboard():
-       · Inserta imágenes del volante/tablero y pedales en posiciones fijas.
-       · Puedes animar pedales (W/Space/Shift) cambiando escala o luminosidad.
-   - El brillo global (overlay blanco) ya representa “Más Luz, Más Velocidad”;
-     si usas una imagen de fondo, pinta la imagen ANTES del overlay.
-*/
+   DETECCIÓN Y SESIÓN DEL AGENTE
+   ============================ */
+function updateCoachingMetrics(dt){
+  if(state.gearIndex===0) state.agent.metrics.timeInNeutral += dt; else state.agent.metrics.timeInNeutral = 0;
+  if(state.rpm > cfg.redline*0.93) state.agent.metrics.timeAboveRed += dt; else state.agent.metrics.timeAboveRed = 0;
+  if(!state.inputs.shift && state.inputs.w && state.gearIndex>0) state.agent.metrics.timeNoClutchAttempt += dt; else state.agent.metrics.timeNoClutchAttempt = 0;
+  pushHistoryTick();
+}
+
+function detectCoachingReason(){
+  if(state.agent.metrics.timeInNeutral > 8) return 'Mucho tiempo en Neutro. Practicar arranque: embrague + freno, luego acelera suave.';
+  if(state.agent.metrics.timeAboveRed > 2) return 'RPM muy altas cerca de la zona roja. Sube de marcha dentro del rango óptimo (2.5k-3.5k).';
+  if(state.agent.metrics.timeNoClutchAttempt > 5) return 'Aceleras sin usar embrague. Coordina embrague (Shift) con aceleración para transiciones suaves.';
+  return '';
+}
+
+function maybeTriggerAgent(){
+  if(!state.agent.enabled || state.agent.active) return;
+  const reason = detectCoachingReason();
+  if(!reason) return;
+  const nowMs = now();
+  if(nowMs - state.agent.lastTrigger < state.agent.cooldownMs) return; // cooldown
+  startAgentSession(reason);
+}
+
+async function startAgentSession(reason){
+  state.agent.active = true;
+  state.agent.reason = reason || 'Asesoramiento del sistema';
+  state.agent.lastTrigger = now();
+  $reason().textContent = 'Motivo: ' + state.agent.reason;
+  $advice().textContent = 'Analizando tu conducción y consultando al agente...';
+  $panel().style.display = 'flex';
+
+  const snapshot = buildAgentSnapshot();
+  const key = (state.agent.apiKey || '').trim();
+  if(!key){
+    $advice().textContent = localFallbackAdvice(snapshot);
+    return;
+  }
+  try{
+    await delay(700 + Math.random()*500); // pequeño retardo intencional
+    const text = await fetchGeminiAdvice(key, snapshot);
+    $advice().textContent = text || localFallbackAdvice(snapshot);
+  }catch(err){
+    $advice().textContent = localFallbackAdvice(snapshot) + '\n\n[Nota: no se pudo contactar a Gemini]';
+  }
+}
+
+function endAgentSession(){
+  state.agent.active = false;
+  $panel().style.display = 'none';
+  $btnResume().style.display = 'none';
+  $coachStatus().textContent = '';
+  state.agent.reason = '';
+}
+
+function buildAgentSnapshot(){
+  return {
+    rpm: Math.round(state.rpm),
+    gear: cfg.gears[state.gearIndex].name,
+    inputs: { accelerating: !!state.inputs.w, braking: !!state.inputs.space, clutch: !!state.inputs.shift },
+    optimalRange: { min: cfg.optimalMin, max: cfg.optimalMax },
+    redline: cfg.redline,
+    reason: state.agent.reason,
+    history: state.agent.history.slice(-20),
+    action: inferDriverAction(),
+    intendedChange: inferIntendedChange(),
+    pedalsPct: estimatePedalsPct()
+  };
+}
+
+function localFallbackAdvice(s){
+  return (
+    `Consejo técnico:\n- Marcha: ${s.gear}. RPM: ${s.rpm}. Rango óptimo: ${s.optimalRange.min}-${s.optimalRange.max}.\n`+
+    `Recomendación práctica:\n- ${state.agent.reason}\n- Practica coordinando embrague (Shift) y acelerador (W).\n`+
+    `Motivación:\n- Paso a paso. Cada intento mejora tu sensibilidad y control. 💪`
+  );
+}
+
+async function fetchGeminiAdvice(apiKey, snapshot){
+  const prompt = buildGeminiPrompt(snapshot);
+  const body = {
+    contents: [{ parts: [{ text: prompt }] }],
+    generationConfig: {
+      temperature: 0.6,
+      maxOutputTokens: 350,
+    }
+  };
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${encodeURIComponent(apiKey)}`;
+  const res = await fetch(url, { method:'POST', headers:{ 'Content-Type':'application/json' }, body: JSON.stringify(body) });
+  if(!res.ok) throw new Error('Gemini API error');
+  const json = await res.json();
+  const text = json?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+  return sanitizeGeminiText(text);
+}
+
+function buildGeminiPrompt(s){
+  return [
+    'Actúa como un copiloto de conducción experimentado, paciente y amigable.',
+    '',
+    'Objetivo: Proporcionar consejos o correcciones inmediatas, junto con una justificación teórica simple, sobre la maniobra de conducción manual que se está realizando en tiempo real.',
+    '',
+    'Definición de Agente de Conducción Manual: Soy un sistema (agente) que monitoriza las interacciones del conductor humano con el vehículo. Mi propósito es analizar estas acciones (cambio de marcha, uso de pedales, revoluciones) para evaluar la técnica y ofrecer feedback constructivo que mejore la eficiencia, seguridad y suavidad de la conducción.',
+    '',
+    'Datos Actuales de la Maniobra:',
+    `- Acción del conductor: ${s.action}`,
+    `- Marcha Actual: ${s.gear}.`,
+    `- Cambio Solicitado/Previsto: ${s.intendedChange}.`,
+    `- Revoluciones (RPM): ${s.rpm} RPM.`,
+    `- Pedales (estado/uso): Freno: ${s.pedalsPct.brake}% pisado, Clutch: ${s.pedalsPct.clutch}% pisado, Acelerador: ${s.pedalsPct.throttle}% pisado.`,
+    '',
+    'Tarea: Analiza los datos de la maniobra e inmediatamente proporciona:',
+    '1. Consejo/Corrección: Una frase clara y directa sobre qué hacer (ej: "Sube la marcha ahora" o "Disminuye la presión del embrague").',
+    '2. Justificación Teórica Amigable: Una explicación concisa y fácil de entender del por qué de la corrección, enfocada en la seguridad, la eficiencia del combustible o el cuidado mecánico del vehículo (ej: "Esto evitará que el motor se revolucione demasiado, lo que es mejor para el consumo y el desgaste").',
+    '',
+    'Formato de Salida:',
+    '¡ALERTA DE CONDUCCIÓN!\nConsejo: <tu consejo/corrección>\nPor qué: <justificación teórica>'
+  ].join('\n');
+}
+
+function sanitizeGeminiText(t){
+  return String(t||'')
+    .replace(/```[\s\S]*?```/g, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function toggleAgent(){
+  state.agent.enabled = !state.agent.enabled;
+  const on = state.agent.enabled;
+  $btnToggle().textContent = `Apoyo de agente: ${on?'ON':'OFF'}`;
+  $btnToggle().setAttribute('aria-pressed', on?'true':'false');
+}
+
+function pushHistoryTick(){
+  const entry = {
+    t: Math.round(performance.now()),
+    rpm: Math.round(state.rpm),
+    gear: cfg.gears[state.gearIndex].name,
+    inputs: { w: !!state.inputs.w, space: !!state.inputs.space, shift: !!state.inputs.shift },
+    type: classifyActionType(),
+    detail: actionDetailString()
+  };
+  state.agent.history.push(entry);
+  if(state.agent.history.length>120) state.agent.history.shift();
+}
+
+function classifyActionType(){
+  if(state.gearIndex===0 && state.inputs.w) return 'acel_neutro';
+  if(state.inputs.w && !state.inputs.shift && state.gearIndex>0) return 'acel_sin_embrague';
+  if(state.rpm>cfg.redline*0.93) return 'rpm_altas';
+  if(state.inputs.space) return 'frenando';
+  if(state.inputs.shift) return 'embrague';
+  return 'normal';
+}
+
+function actionDetailString(){
+  return `rpm=${Math.round(state.rpm)}, gear=${cfg.gears[state.gearIndex].name}, W=${!!state.inputs.w}, Space=${!!state.inputs.space}, Shift=${!!state.inputs.shift}`;
+}
+
+function delay(ms){ return new Promise(r=>setTimeout(r, ms)); }
+
+function inferDriverAction(){
+  const last = state.agent.history[state.agent.history.length-1];
+  if(!last) return 'Observando la marcha y las RPM.';
+  switch(last.type){
+    case 'acel_neutro': return 'Acelerando en Neutro.';
+    case 'acel_sin_embrague': return 'Acelerando sin usar embrague en marcha engranada.';
+    case 'rpm_altas': return 'Manteniendo RPM altas cerca de zona roja.';
+    case 'frenando': return 'Frenando.';
+    case 'embrague': return 'Usando el embrague.';
+    default: return 'Conducción normal sin cambios recientes.';
+  }
+}
+
+function inferIntendedChange(){
+  // Heurística simple: si RPM altas y en marcha < 5, sugiere subir; si en Neutro y freno+embrague, sugiere iniciar en 1ª
+  const gearIdx = state.gearIndex;
+  if(gearIdx===0){
+    if(state.inputs.shift && state.inputs.space) return 'Iniciar movimiento: subir a 1ª';
+    return 'Mantener en Neutro';
+  }
+  if(state.rpm > cfg.optimalMax && gearIdx < cfg.gears.length-1) return `Subir a ${cfg.gears[gearIdx+1].name}ª`;
+  if(state.rpm < cfg.optimalMin && gearIdx > 1) return `Bajar a ${cfg.gears[gearIdx-1].name}ª`;
+  return 'Mantener';
+}
+
+function estimatePedalsPct(){
+  // Como no hay presión analógica real, mapear booleanos a 0/100 y freno suave si cae a ralentí con Space
+  const throttle = state.inputs.w ? 100 : 0;
+  const brake = state.inputs.space ? 25 : 0; // aproximación visual
+  const clutch = state.inputs.shift ? 100 : 0;
+  return { throttle, brake, clutch };
+}
+
+
 </script>
 </body>
 </html>
